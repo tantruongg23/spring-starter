@@ -1,0 +1,19 @@
+info:
+  name: "get "
+  type: http
+  seq: 2
+
+http:
+  method: GET
+  url: http://localhost:8888/api/users/:id
+  params:
+    - name: id
+      value: d4a0463e-9758-4dee-86a2-d371965472c1
+      type: path
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

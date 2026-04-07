@@ -1,0 +1,28 @@
+spring:
+  application:
+    name: spring-starter
+  
+  datasource:
+    url: jdbc:postgresql://localhost:5432/eshop?stringtype=unspecified
+    username: postgres     # Replace with your local PostgreSQL username
+    password: password     # Replace with your local PostgreSQL password
+    driver-class-name: org.postgresql.Driver
+
+  jpa:
+    hibernate:
+      # 'validate' ensures that the database schema matches the Hibernate entities. Flyway will manage schema creation.
+     ddl-auto: update
+    show-sql: true         # Prints the queries Hibernate generates to the console
+    properties:
+      hibernate:
+        format_sql: true   # Formats the SQL queries to be readable multi-line logs
+        dialect: org.hibernate.dialect.PostgreSQLDialect
+
+server:
+  port: 8888
+
+security:
+  jwt:
+    secret-key: ${JWT_SECRET:dGhpcy1pcy1hLXZlcnktbG9uZy0yNTYtYml0LXNlY3JldC1rZXktZm9yLWRldi1vbmx5LWNoYW5nZS1pbi1wcm9kdWN0aW9u}
+    access-token-expiration: 900000
+    refresh-token-expiration: 604800000

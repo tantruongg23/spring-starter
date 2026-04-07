@@ -1,0 +1,25 @@
+info:
+  name: Create user
+  type: http
+  seq: 1
+
+http:
+  method: POST
+  url: http://localhost:8888/api/users
+  body:
+    type: json
+    data: |-
+      {
+        "id": "d4a0463e-9758-4dee-86a2-d371965472c1",
+        "username": "tantecgaa",
+        "email": "tantecgaa@gmail.com",
+        "password": "tantecgaa11231",
+        "role": "ADMIN"
+      }
+  auth: inherit
+
+settings:
+  encodeUrl: true
+  timeout: 0
+  followRedirects: true
+  maxRedirects: 5

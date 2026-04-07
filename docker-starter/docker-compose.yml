@@ -1,0 +1,17 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:17.7
+    container_name: eshop-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: eshop
+      # TZ: Asia/Ho_Chi_Minh
+    volumes:
+      # This bind-maps the data directly to a physical 'postgres-data' folder right next to this file
+      - ./postgres-data:/var/lib/postgresql/data
+    restart: unless-stopped
