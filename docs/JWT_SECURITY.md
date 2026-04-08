@@ -17,34 +17,38 @@
 ## Architecture Overview
 
 ```
-┌──────────┐        ┌─────────────────────┐       ┌──────────────────┐
-│  Client  │──JWT──▷│ JwtAuthFilter       │──────▷│  Controller      │
-│ (Bruno)  │        │ (OncePerRequestFilter│       │  (Protected)     │
-└──────────┘        └──────────┬──────────┘       └──────────────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │    JwtService       │
-                    │ (parse/validate/    │
-                    │  generate tokens)   │
-                    └──────────┬──────────┘
-                               │
-                    ┌──────────▼──────────┐
-                    │ UserDetailsService  │
-                    │ (load user from DB) │
-                    └─────────────────────┘
+┌──────────┐        ┌──────────────────────────────────┐       ┌──────────────────┐
+│  Client  │──JWT──▷│ BearerTokenAuthenticationFilter  │──────▷│  Controller      │
+│ (Bruno)  │        │ (Spring Security built-in)        │       │  (Protected)     │
+└──────────┘        └──────────────┬───────────────────┘       └──────────────────┘
+                                   │
+                        ┌──────────▼──────────┐
+                        │   NimbusJwtDecoder   │
+                        │ (validate signature  │
+                        │  + expiry, no DB)    │
+                        └──────────┬──────────┘
+                                   │
+                        ┌──────────▼──────────────┐
+                        │ JwtAuthenticationConverter│
+                        │ (map "role" claim →       │
+                        │  GrantedAuthority)        │
+                        └─────────────────────────-┘
 ```
 
 **Flow:**
 1. Client sends `Authorization: Bearer <token>` header
-2. `JwtAuthenticationFilter` intercepts the request
-3. `JwtService` validates the token (signature, expiry, claims)
-4. `UserDetailsServiceImpl` loads the user from PostgreSQL
-5. `SecurityContextHolder` is populated with the authenticated user
+2. `BearerTokenAuthenticationFilter` (Spring Security built-in) extracts the token
+3. `NimbusJwtDecoder` verifies the signature and checks expiry — **no database call**
+4. `JwtAuthenticationConverter` reads the `role` claim and creates a `GrantedAuthority`
+5. `SecurityContextHolder` is populated with the authenticated principal
 6. The request proceeds to the controller
 
 **On authentication failure:**
-- Missing/invalid token → `JwtAuthenticationEntryPoint` returns **401**
+- Missing/invalid/expired token → `JwtAuthenticationEntryPoint` returns **401**
 - Insufficient role → `CustomAccessDeniedHandler` returns **403**
+
+> **What changed from the previous implementation:**
+> The custom `JwtAuthenticationFilter` (which extended `OncePerRequestFilter` and called `UserDetailsService` on every request) has been removed. Token validation is now fully delegated to Spring Security's OAuth2 Resource Server support — no manual filter, no database lookup per request.
 
 ---
 
@@ -61,7 +65,7 @@ eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJhZG1pbiIsInJvbGUiOiJST0xFX0FETUlOIn0.abc123...
 ```
 
 | Part | Contains | Purpose |
-|------|----------|---------|
+|------|----------|---------| 
 | **Header** | `{"alg": "HS256"}` | Signing algorithm |
 | **Payload** | `{"sub": "admin", "role": "ROLE_ADMIN", "exp": 1234567890}` | User claims |
 | **Signature** | HMAC-SHA256(header + payload, secret) | Integrity verification |
@@ -78,11 +82,12 @@ Unlike session-based auth (which stores state on the server), JWT is **stateless
 | | Access Token | Refresh Token |
 |---|---|---|
 | **Purpose** | Authenticate API requests | Obtain new access tokens |
-| **Lifetime** | Short (15 minutes) | Long (7 days) |
+| **Lifetime** | Short (2 minutes default) | Long (7 days) |
 | **Contains** | username, role, expiry | username, expiry only |
 | **Stored in** | Client memory (JS variable) | HttpOnly cookie or secure storage |
 | **Sent with** | Every API request (`Authorization` header) | Only to `/api/auth/refresh` |
 | **Persisted on server** | No | Yes (in `refresh_tokens` table) |
+| **Validated by** | `NimbusJwtDecoder` (crypto only) | `AuthService` (DB lookup required) |
 
 ---
 
@@ -95,14 +100,16 @@ security:
   jwt:
     # HMAC-SHA256 signing key (Base64-encoded, minimum 256 bits)
     # In production: use ${JWT_SECRET} environment variable
-    secret-key: ${JWT_SECRET:dGhpcy1pcy1hLXZlcnktbG9uZy1...}
+    secret-key: ${JWT_SECRET:dGhpcy1pcy1hLXZlcnktbG9uZy0yNTYtYml0LXNlY3JldC1rZXktZm9yLWRldi1vbmx5LWNoYW5nZS1pbi1wcm9kdWN0aW9u}
 
-    # Access token lifetime in milliseconds (default: 15 minutes)
-    access-token-expiration: 900000
+    # Access token lifetime — ISO-8601 duration format
+    access-token-expiration: 2m    # 2 minutes
 
-    # Refresh token lifetime in milliseconds (default: 7 days)
-    refresh-token-expiration: 604800000
+    # Refresh token lifetime — ISO-8601 duration format
+    refresh-token-expiration: 7d   # 7 days
 ```
+
+> **Duration format:** Values use Spring's ISO-8601 duration notation (`2m`, `7d`, `PT15M`, etc.), not raw milliseconds. This is bound to `java.time.Duration` fields in `JwtService`.
 
 ### Production Checklist
 - [ ] Set `JWT_SECRET` environment variable with a cryptographically random 256-bit key
@@ -143,7 +150,7 @@ Register a new user account.
         "access_token": "eyJhbGciOiJIUzI1NiJ9...",
         "refresh_token": "eyJhbGciOiJIUzI1NiJ9...",
         "token_type": "Bearer",
-        "expires_in": 900
+        "expires_in": 120
     }
 }
 ```
@@ -175,7 +182,7 @@ Authenticate with username and password.
         "access_token": "eyJhbGciOiJIUzI1NiJ9...",
         "refresh_token": "eyJhbGciOiJIUzI1NiJ9...",
         "token_type": "Bearer",
-        "expires_in": 900
+        "expires_in": 120
     }
 }
 ```
@@ -237,6 +244,8 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
 | `CUSTOMER` | Default role for self-registered users | `ROLE_CUSTOMER` |
 | `ADMIN` | System administrator | `ROLE_ADMIN` |
 
+The `role` claim is embedded in the access token as a single string (e.g., `"ROLE_ADMIN"`). `JwtAuthenticationConverter` reads this claim and converts it to a `SimpleGrantedAuthority` — no database lookup required.
+
 ### Endpoint Access Matrix
 
 | Endpoint | Method | CUSTOMER | ADMIN | Unauthenticated |
@@ -274,7 +283,7 @@ Authorization: Bearer eyJhbGciOiJIUzI1NiJ9...
        ▼
 ┌──────────────┐     ┌──────────────┐
 │ Access Token │     │Refresh Token │
-│  (15 min)    │     │   (7 days)   │
+│   (2 min)    │     │   (7 days)   │
 └──────┬───────┘     └──────┬───────┘
        │                    │
        ▼                    │
@@ -305,62 +314,73 @@ When a refresh token is used:
 ```
 src/main/java/com/example/springstarter/
 ├── controller/
-│   └── AuthController.java           # Register, Login, Refresh, Logout endpoints
+│   └── AuthController.java              # Register, Login, Refresh, Logout endpoints
 ├── domain/
 │   ├── dto/
-│   │   ├── AuthResponseDTO.java      # Token response (access + refresh + expiry)
-│   │   ├── LoginRequestDTO.java      # Login payload (username + password)
-│   │   ├── RefreshTokenRequestDTO.java # Refresh/logout payload
-│   │   └── RegisterRequestDTO.java   # Registration payload (validated)
+│   │   ├── AuthResponseDTO.java         # Token response (access + refresh + expiry)
+│   │   ├── LoginRequestDTO.java         # Login payload (username + password)
+│   │   ├── RefreshTokenRequestDTO.java  # Refresh/logout payload
+│   │   └── RegisterRequestDTO.java      # Registration payload (validated)
 │   └── entity/
-│       └── RefreshToken.java         # Persisted refresh token entity
+│       └── RefreshToken.java            # Persisted refresh token entity
 ├── repository/
-│   └── RefreshTokenRepository.java   # Refresh token CRUD + cleanup
+│   └── RefreshTokenRepository.java      # Refresh token CRUD + cleanup
 ├── security/
-│   ├── CustomAccessDeniedHandler.java    # 403 JSON response handler
-│   ├── JwtAuthenticationEntryPoint.java  # 401 JSON response handler
-│   ├── JwtAuthenticationFilter.java      # Extracts & validates JWT from header
-│   ├── JwtService.java                   # Token generation, parsing, validation
-│   ├── SecurityConfig.java               # Central security configuration
-│   ├── UserDetailsImpl.java              # Spring Security UserDetails wrapper
-│   └── UserDetailsServiceImpl.java       # Loads user from DB for auth
+│   ├── CustomAccessDeniedHandler.java   # 403 JSON response handler
+│   ├── JwtAuthenticationEntryPoint.java # 401 JSON response handler (OAuth2-aware)
+│   ├── JwtService.java                  # Token generation only (Nimbus JOSE+JWT)
+│   ├── SecurityConfig.java              # Central security config + OAuth2 resource server
+│   ├── UserDetailsImpl.java             # Spring Security UserDetails wrapper
+│   └── UserDetailsServiceImpl.java      # Loads user from DB (login only)
 └── service/
-    └── AuthService.java              # Business logic: register, login, refresh, logout
+    └── AuthService.java             # Business logic: register, login, refresh, logout
 ```
+
+> **Removed:** `JwtAuthenticationFilter.java` — this class no longer exists. Token validation is handled entirely by Spring Security's `BearerTokenAuthenticationFilter`.
 
 ---
 
 ## Key Classes Explained
 
 ### `JwtService`
-The **core JWT utility**. All token operations go through here.
+Responsible **only for token generation**. Validation and claim extraction are delegated to `NimbusJwtDecoder` (configured in `SecurityConfig`).
 
 | Method | Purpose |
 |--------|---------|
-| `generateAccessToken(UserDetails)` | Creates a signed JWT with role claim, 15min expiry |
-| `generateRefreshToken(UserDetails)` | Creates a signed JWT with 7-day expiry |
-| `extractUsername(token)` | Parses the `sub` (subject) claim |
-| `isTokenValid(token, UserDetails)` | Validates signature + expiry + username match |
+| `generateAccessToken(UserDetails)` | Creates a signed JWT with `role` claim, configured expiry |
+| `generateRefreshToken(UserDetails)` | Creates a signed JWT with expiry only (no role claim) |
+| `getAccessTokenExpiration()` | Returns access token TTL in milliseconds |
+| `getRefreshTokenExpiration()` | Returns refresh token TTL in milliseconds |
 
-**Signing:** Uses HMAC-SHA256 (`HS256`) with a Base64-decoded secret key via the JJWT library.
+**Library:** Uses the **Nimbus JOSE+JWT** library (bundled with `spring-boot-starter-oauth2-resource-server`). The old JJWT dependency has been removed.
 
-### `JwtAuthenticationFilter`
-Extends `OncePerRequestFilter` — runs **once per HTTP request**.
-
-1. Checks for `Authorization: Bearer <token>` header
-2. If present, extracts and validates the JWT via `JwtService`
-3. On success: populates `SecurityContextHolder` with the authenticated user
-4. On failure: does nothing (lets `JwtAuthenticationEntryPoint` handle it)
+**Signing:** HMAC-SHA256 (`HS256`) via `MACSigner` with a Base64-decoded secret key from `application.yaml`.
 
 ### `SecurityConfig`
 The central `@Configuration` class. Key beans:
 
 | Bean | Purpose |
 |------|---------|
-| `SecurityFilterChain` | Defines URL rules, session policy, filter chain |
+| `SecurityFilterChain` | Defines URL rules, session policy, and OAuth2 resource server |
+| `JwtDecoder` | `NimbusJwtDecoder` that verifies HMAC-SHA256 signature + expiry |
+| `JwtAuthenticationConverter` | Maps the `role` JWT claim to a `SimpleGrantedAuthority` |
 | `PasswordEncoder` | BCrypt with default strength (10 rounds) |
-| `AuthenticationManager` | Used by `AuthService` for login authentication |
-| `DaoAuthenticationProvider` | Connects `UserDetailsService` + `PasswordEncoder` |
+| `AuthenticationManager` | Used by `AuthService` for login only |
+| `DaoAuthenticationProvider` | Connects `UserDetailsService` + `PasswordEncoder` (login only) |
+
+**OAuth2 Resource Server configuration:**
+```java
+.oauth2ResourceServer(oauth2 -> oauth2
+    .jwt(jwt -> jwt
+        .decoder(jwtDecoder)
+        .jwtAuthenticationConverter(jwtAuthenticationConverter())
+    )
+    .authenticationEntryPoint(jwtAuthenticationEntryPoint)
+)
+```
+
+### `JwtAuthenticationEntryPoint`
+Returns a structured JSON 401 response. Handles both standard `AuthenticationException` and `OAuth2AuthenticationException` (thrown by the resource server when a token is malformed, expired, or has an invalid signature) — extracting human-readable OAuth2 error descriptions when available.
 
 ### `AuthService`
 Business logic for the complete auth lifecycle:
@@ -369,7 +389,7 @@ Business logic for the complete auth lifecycle:
 |--------|--------------|
 | `register()` | Validates uniqueness → BCrypt hash → save user → generate tokens |
 | `login()` | Authenticate via `AuthenticationManager` → generate tokens |
-| `refreshToken()` | Validate refresh token → revoke old → issue new pair (rotation) |
+| `refreshToken()` | Validate refresh token via `JwtDecoder` → revoke old → issue new pair (rotation) |
 | `logout()` | Revoke the refresh token |
 
 ---
@@ -377,14 +397,15 @@ Business logic for the complete auth lifecycle:
 ## Security Best Practices
 
 ### What This Implementation Does Right
-1. **Stateless sessions** — `SessionCreationPolicy.STATELESS` prevents HttpSession creation
+1. **Stateless sessions** — `SessionCreationPolicy.STATELESS` prevents `HttpSession` creation
 2. **BCrypt password hashing** — Passwords are never stored in plaintext
-3. **Short-lived access tokens** — 15 minutes limits exposure window
+3. **Short-lived access tokens** — 2-minute default limits the exposure window
 4. **Refresh token rotation** — Old tokens are revoked on use, preventing replay attacks
 5. **Token reuse detection** — If a revoked token is reused, all user tokens are deleted
 6. **CSRF disabled** — Appropriate for stateless JWT APIs (CSRF attacks rely on cookies)
 7. **Structured error responses** — 401/403 return consistent `ApiResponse` JSON, never HTML
 8. **No sensitive data in tokens** — Only `username` and `role` in the payload
+9. **No DB call per request** — `NimbusJwtDecoder` validates tokens cryptographically; `UserDetailsService` is only invoked during login
 
 ### Production Hardening Checklist
 - [ ] **Environment-based secret**: Set `JWT_SECRET` env var (never commit secrets)
@@ -424,7 +445,7 @@ curl http://localhost:8888/api/products \
 ### 4. Access Without Token (Expect 401)
 ```bash
 curl http://localhost:8888/api/products
-# Response: {"status":401,"message":"Authentication required..."}
+# Response: {"status":401,"message":"Authentication required. Please provide a valid JWT token."}
 ```
 
 ### 5. Access Admin Endpoint as Customer (Expect 403)
@@ -453,7 +474,7 @@ curl -X POST http://localhost:8888/api/auth/logout \
 
 ---
 
-## Dependencies Added
+## Dependencies
 
 ```xml
 <!-- Spring Security (authentication & authorization framework) -->
@@ -462,25 +483,17 @@ curl -X POST http://localhost:8888/api/auth/logout \
     <artifactId>spring-boot-starter-security</artifactId>
 </dependency>
 
-<!-- JJWT — Java JWT library for token creation and parsing -->
+<!-- Spring Security OAuth2 Resource Server (bundles Nimbus JOSE+JWT) -->
+<!-- Replaces the old JJWT (io.jsonwebtoken) dependency trio -->
 <dependency>
-    <groupId>io.jsonwebtoken</groupId>
-    <artifactId>jjwt-api</artifactId>
-    <version>0.12.6</version>
-</dependency>
-<dependency>
-    <groupId>io.jsonwebtoken</groupId>
-    <artifactId>jjwt-impl</artifactId>
-    <version>0.12.6</version>
-    <scope>runtime</scope>
-</dependency>
-<dependency>
-    <groupId>io.jsonwebtoken</groupId>
-    <artifactId>jjwt-jackson</artifactId>
-    <version>0.12.6</version>
-    <scope>runtime</scope>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-oauth2-resource-server</artifactId>
 </dependency>
 ```
+
+> **JJWT removed:** The three `io.jsonwebtoken` artifacts (`jjwt-api`, `jjwt-impl`, `jjwt-jackson`) are no longer used. The Nimbus JOSE+JWT library is transitively included via `spring-boot-starter-oauth2-resource-server` and provides the `MACSigner`, `SignedJWT`, and `NimbusJwtDecoder` types used throughout the security layer.
+
+---
 
 ## Database Migrations
 
