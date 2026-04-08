@@ -1,27 +1,39 @@
 package com.example.springstarter.security;
 
-import io.jsonwebtoken.Claims;
-import io.jsonwebtoken.JwtException;
-import io.jsonwebtoken.Jwts;
-import io.jsonwebtoken.io.Decoders;
-import io.jsonwebtoken.security.Keys;
+import com.nimbusds.jose.JWSAlgorithm;
+import com.nimbusds.jose.JWSHeader;
+import com.nimbusds.jose.crypto.MACSigner;
+import com.nimbusds.jwt.JWTClaimsSet;
+import com.nimbusds.jwt.SignedJWT;
+import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.security.core.GrantedAuthority;
 import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.stereotype.Service;
 
-import javax.crypto.SecretKey;
 import java.time.Duration;
+import java.time.Instant;
+import java.util.Base64;
 import java.util.Date;
-import java.util.Map;
-import java.util.function.Function;
 
-import static com.example.springstarter.domain.enumerate.Role.*;
+import static com.example.springstarter.domain.enumerate.Role.CUSTOMER;
 
+/**
+ * Responsible only for JWT <em>generation</em>.
+ * <p>
+ * Token <em>validation</em> and claim extraction are delegated entirely to
+ * Spring Security's {@code NimbusJwtDecoder}, which is configured as a bean
+ * in {@link SecurityConfig} and wired into the OAuth2 Resource Server filter chain.
+ * </p>
+ */
 @Service
+@Slf4j
 public class JwtService {
 
-    private final SecretKey signingKey;
+    /** Claim name for the user's role inside the access token. */
+    public static final String ROLE_CLAIM = "role";
+
+    private final byte[] secretKeyBytes;
     private final Duration accessTokenExpiration;
     private final Duration refreshTokenExpiration;
 
@@ -29,13 +41,13 @@ public class JwtService {
             @Value("${security.jwt.secret-key}") String secretKey,
             @Value("${security.jwt.access-token-expiration}") Duration accessTokenExpiration,
             @Value("${security.jwt.refresh-token-expiration}") Duration refreshTokenExpiration) {
-        this.signingKey = Keys.hmacShaKeyFor(Decoders.BASE64.decode(secretKey));
+        this.secretKeyBytes = Base64.getDecoder().decode(secretKey);
         this.accessTokenExpiration = accessTokenExpiration;
         this.refreshTokenExpiration = refreshTokenExpiration;
     }
 
     /**
-     * Generate an access token with role claims.
+     * Generate a signed access token containing the user's role claim.
      */
     public String generateAccessToken(UserDetails userDetails) {
         String role = userDetails.getAuthorities().stream()
@@ -43,41 +55,21 @@ public class JwtService {
                 .map(GrantedAuthority::getAuthority)
                 .orElse(CUSTOMER.getAuthority());
 
-        return buildToken(userDetails.getUsername(), Map.of("role", role), getAccessTokenExpiration());
+        JWTClaimsSet claims = baseClaimsBuilder(userDetails.getUsername(), accessTokenExpiration)
+                .claim(ROLE_CLAIM, role)
+                .build();
+
+        return sign(claims);
     }
 
     /**
-     * Generate a refresh token (minimal claims — only subject and expiry).
+     * Generate a signed refresh token (subject + expiry only — no role claim).
      */
     public String generateRefreshToken(UserDetails userDetails) {
-        return buildToken(userDetails.getUsername(), Map.of(), getRefreshTokenExpiration());
-    }
+        JWTClaimsSet claims = baseClaimsBuilder(userDetails.getUsername(), refreshTokenExpiration)
+                .build();
 
-    /**
-     * Extract the username (subject) from the token.
-     */
-    public String extractUsername(String token) {
-        return extractClaim(token, Claims::getSubject);
-    }
-
-    /**
-     * Validate the token against the UserDetails.
-     */
-    public boolean isTokenValid(String token, UserDetails userDetails) {
-        try {
-            String username = extractUsername(token);
-            return username.equals(userDetails.getUsername()) && !isTokenExpired(token);
-        } catch (JwtException | IllegalArgumentException e) {
-            return false;
-        }
-    }
-
-    /**
-     * Extract a specific claim from the token.
-     */
-    public <T> T extractClaim(String token, Function<Claims, T> claimsResolver) {
-        Claims claims = extractAllClaims(token);
-        return claimsResolver.apply(claims);
+        return sign(claims);
     }
 
     public long getAccessTokenExpiration() {
@@ -90,27 +82,22 @@ public class JwtService {
 
     // ---- Private helpers ----
 
-    private String buildToken(String subject, Map<String, Object> extraClaims, long expirationMs) {
-        long now = System.currentTimeMillis();
-        return Jwts.builder()
-                .claims(extraClaims)
+    private JWTClaimsSet.Builder baseClaimsBuilder(String subject, Duration ttl) {
+        Instant now = Instant.now();
+        return new JWTClaimsSet.Builder()
                 .subject(subject)
-                .issuedAt(new Date(now))
-                .expiration(new Date(now + expirationMs))
-                .signWith(signingKey, Jwts.SIG.HS256)
-                .compact();
+                .issueTime(Date.from(now))
+                .expirationTime(Date.from(now.plus(ttl)));
     }
 
-    private Claims extractAllClaims(String token) {
-        return Jwts.parser()
-                .verifyWith(signingKey)
-                .build()
-                .parseSignedClaims(token)
-                .getPayload();
-    }
-
-    private boolean isTokenExpired(String token) {
-        Date expiration = extractClaim(token, Claims::getExpiration);
-        return expiration.before(new Date());
+    private String sign(JWTClaimsSet claims) {
+        try {
+            JWSHeader header = new JWSHeader(JWSAlgorithm.HS256);
+            SignedJWT signedJWT = new SignedJWT(header, claims);
+            signedJWT.sign(new MACSigner(secretKeyBytes));
+            return signedJWT.serialize();
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to sign JWT", e);
+        }
     }
 }
