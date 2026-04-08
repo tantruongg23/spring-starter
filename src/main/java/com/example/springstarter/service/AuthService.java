@@ -131,7 +131,7 @@ public class AuthService {
         return AuthResponseDTO.builder()
                 .accessToken(accessToken)
                 .refreshToken(refreshToken)
-                .expiresIn(jwtService.getAccessTokenExpiration() / 1000) // seconds
+                .expiresIn(jwtService.getAccessTokenExpiration())
                 .build();
     }
 }

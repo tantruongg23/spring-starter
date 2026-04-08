@@ -1,0 +1,314 @@
+# Integrate Spring Security with Production-Ready JWT Authentication
+
+This plan integrates Spring Security 7 with JWT-based stateless authentication into the existing E-Commerce Order Management System (Spring Boot 4.0.4). It covers the full auth lifecycle: registration, login, token refresh, role-based access control, and secure error handling.
+
+## User Review Required
+
+> [!IMPORTANT]
+> **Role Enum Mismatch**: The database migration `V3` defines `user_role` as `('ADMIN', 'USER')`, but the Java enum `Role.java` uses `CUSTOMER` instead of `USER`. The seed data `V2` also inserts `'CUSTOMER'`. This will cause issues. I recommend adding a Flyway migration to add `'CUSTOMER'` to the PostgreSQL enum and keeping the Java enum as-is (`ADMIN`, `CUSTOMER`).
+
+> [!WARNING]
+> **Existing Plaintext Passwords**: The seed data stores passwords as plaintext (`'password'`). After this integration, all new users will have BCrypt-hashed passwords. The migration will re-hash the existing sample passwords so login works immediately.
+
+> [!IMPORTANT]
+> **JWT Secret Key**: The plan stores the signing key in `application.yaml` for development. For production, this MUST be loaded from an environment variable or a secrets vault (e.g., `${JWT_SECRET}`). The plan sets this up with a default-with-env-override pattern.
+
+---
+
+## Proposed Changes
+
+### 1. Dependencies
+
+#### [MODIFY] [pom.xml](file:///c:/Workspace/spring-starter/pom.xml)
+
+Add three new dependency groups:
+
+```xml
+<!-- Spring Security -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security</artifactId>
+</dependency>
+
+<!-- JJWT (JSON Web Token) -->
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-api</artifactId>
+    <version>0.12.6</version>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-impl</artifactId>
+    <version>0.12.6</version>
+    <scope>runtime</scope>
+</dependency>
+<dependency>
+    <groupId>io.jsonwebtoken</groupId>
+    <artifactId>jjwt-jackson</artifactId>
+    <version>0.12.6</version>
+    <scope>runtime</scope>
+</dependency>
+
+<!-- Spring Security Test -->
+<dependency>
+    <groupId>org.springframework.boot</groupId>
+    <artifactId>spring-boot-starter-security-test</artifactId>
+    <scope>test</scope>
+</dependency>
+```
+
+---
+
+### 2. Application Configuration
+
+#### [MODIFY] [application.yaml](file:///c:/Workspace/spring-starter/src/main/resources/application.yaml)
+
+Add JWT configuration section:
+
+```yaml
+security:
+  jwt:
+    secret-key: ${JWT_SECRET:a-very-long-256-bit-base64-encoded-secret-key-for-dev-only-change-in-prod}
+    access-token-expiration: 900000      # 15 minutes in ms
+    refresh-token-expiration: 604800000  # 7 days in ms
+```
+
+---
+
+### 3. Security Infrastructure (`security` package)
+
+#### [NEW] `security/SecurityConfig.java`
+The main `@Configuration` class defining:
+- `SecurityFilterChain` bean — disables CSRF, sets stateless session, defines public vs protected endpoints
+- `PasswordEncoder` bean (BCrypt)
+- `AuthenticationManager` bean
+- JWT filter registration (before `UsernamePasswordAuthenticationFilter`)
+- Custom `AuthenticationEntryPoint` for 401 responses
+- Custom `AccessDeniedHandler` for 403 responses
+
+**Authorization rules:**
+| Path Pattern | Access |
+|---|---|
+| `POST /api/auth/**` | Public (permit all) |
+| `POST /api/products/**` | `ADMIN` only |
+| `PUT /api/products/**` | `ADMIN` only |
+| `DELETE /api/products/**` | `ADMIN` only |
+| `GET /api/products/**` | Authenticated |
+| `GET /api/orders/user/{userId}` | Authenticated (service layer enforces ownership) |
+| `POST /api/orders` | Authenticated |
+| `GET /api/users/**` | Authenticated |
+| Everything else | Authenticated |
+
+#### [NEW] `security/JwtAuthenticationFilter.java`
+`OncePerRequestFilter` that:
+1. Extracts `Authorization: Bearer <token>` header
+2. Parses and validates the JWT via `JwtService`
+3. Loads `UserDetails` and sets `SecurityContextHolder` authentication
+4. Passes through to the next filter on any error (letting the `AuthenticationEntryPoint` handle it)
+
+#### [NEW] `security/JwtAuthenticationEntryPoint.java`
+Returns a structured `ApiResponse` JSON body with HTTP 401 for unauthenticated requests.
+
+#### [NEW] `security/CustomAccessDeniedHandler.java`
+Returns a structured `ApiResponse` JSON body with HTTP 403 for unauthorized requests.
+
+#### [NEW] `security/UserDetailsImpl.java`
+Implements `UserDetails`, wrapping the `User` entity. Maps `Role.ADMIN` → `ROLE_ADMIN`, `Role.CUSTOMER` → `ROLE_CUSTOMER`.
+
+#### [NEW] `security/UserDetailsServiceImpl.java`
+Implements `UserDetailsService`, loading user by username from `UserRepository`.
+
+---
+
+### 4. JWT Service (`security` package)
+
+#### [NEW] `security/JwtService.java`
+
+Responsibility: all JWT operations. Methods:
+- `generateAccessToken(UserDetails)` → signed JWT with subject=username, role claim, 15-min expiry
+- `generateRefreshToken(UserDetails)` → signed JWT with subject=username, 7-day expiry
+- `extractUsername(String token)` → parses the subject claim
+- `isTokenValid(String token, UserDetails)` → validates signature + expiration + username match
+- `extractClaim(String token, Function)` → generic claim extractor
+
+Uses HMAC-SHA256 (`HS256`) with the configured secret key.
+
+---
+
+### 5. Refresh Token Entity & Repository
+
+#### [NEW] `domain/entity/RefreshToken.java`
+
+| Column | Type | Notes |
+|---|---|---|
+| `id` | `UUID` | PK |
+| `token` | `String` | The JWT refresh token string, unique, indexed |
+| `user_id` | `UUID` | FK to `users`, `@ManyToOne` |
+| `expires_at` | `Instant` | When the token expires |
+| `revoked` | `boolean` | For manual revocation / logout |
+| `created_at` | `Instant` | Audit |
+
+#### [NEW] `repository/RefreshTokenRepository.java`
+
+Methods:
+- `findByToken(String token)` → `Optional<RefreshToken>`
+- `deleteByUser(User user)` → revoke all tokens on password change / logout-all
+- `deleteAllByExpiresAtBefore(Instant now)` → cleanup expired tokens
+
+---
+
+### 6. Auth DTOs (`domain/dto`)
+
+#### [NEW] `domain/dto/LoginRequestDTO.java`
+```java
+{ String username, String password }
+```
+
+#### [NEW] `domain/dto/RegisterRequestDTO.java`
+```java
+{ String username, String email, String password }
+// Validated with @NotBlank, @Email, @Size(min=8)
+```
+
+#### [NEW] `domain/dto/AuthResponseDTO.java`
+```java
+{ String accessToken, String refreshToken, String tokenType = "Bearer", long expiresIn }
+```
+
+#### [NEW] `domain/dto/RefreshTokenRequestDTO.java`
+```java
+{ String refreshToken }
+```
+
+---
+
+### 7. Auth Service & Controller
+
+#### [NEW] `service/AuthService.java`
+
+Business logic for authentication:
+- `register(RegisterRequestDTO)` → creates user with BCrypt password, `Role.CUSTOMER` default, generates token pair
+- `login(LoginRequestDTO)` → authenticates via `AuthenticationManager`, generates token pair
+- `refreshToken(RefreshTokenRequestDTO)` → validates refresh token, issues new access token (+ rotates refresh token for security)
+- `logout(String refreshToken)` → revokes the refresh token
+
+#### [NEW] `controller/AuthController.java`
+
+| Method | Path | Request | Response |
+|---|---|---|---|
+| `POST` | `/api/auth/register` | `RegisterRequestDTO` | `ApiResponse<AuthResponseDTO>` |
+| `POST` | `/api/auth/login` | `LoginRequestDTO` | `ApiResponse<AuthResponseDTO>` |
+| `POST` | `/api/auth/refresh` | `RefreshTokenRequestDTO` | `ApiResponse<AuthResponseDTO>` |
+| `POST` | `/api/auth/logout` | `RefreshTokenRequestDTO` | `ApiResponse<Void>` |
+
+---
+
+### 8. Modifications to Existing Code
+
+#### [MODIFY] [UserService.java](file:///c:/Workspace/spring-starter/src/main/java/com/example/springstarter/service/UserService.java)
+- Remove plaintext password handling
+- Use `PasswordEncoder` when creating/updating users
+- The `createUser` method becomes admin-only user management (distinct from `AuthService.register`)
+
+#### [MODIFY] [UserController.java](file:///c:/Workspace/spring-starter/src/main/java/com/example/springstarter/controller/UserController.java)
+- Add `@PreAuthorize("hasRole('ADMIN')")` on `createUser` (admin user management)
+- The `getUser` endpoint stays authenticated (any logged-in user)
+
+#### [MODIFY] [OrderController.java](file:///c:/Workspace/spring-starter/src/main/java/com/example/springstarter/controller/OrderController.java)
+- No annotation changes needed — ownership is enforced at the service layer, but later we can add `@PreAuthorize` checks
+
+#### [MODIFY] [GlobalExceptionHandler.java](file:///c:/Workspace/spring-starter/src/main/java/com/example/springstarter/exception/GlobalExceptionHandler.java)
+- Add handlers for `BadCredentialsException`, `AuthenticationException`, and `AccessDeniedException`
+
+---
+
+### 9. Database Migration
+
+#### [NEW] `src/main/resources/db/migration/V4__create_refresh_tokens_table.sql`
+
+```sql
+CREATE TABLE refresh_tokens (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    token         VARCHAR(512) NOT NULL UNIQUE,
+    user_id       UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    expires_at    TIMESTAMP NOT NULL,
+    revoked       BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at    TIMESTAMP NOT NULL DEFAULT NOW()
+);
+
+CREATE INDEX idx_refresh_tokens_token ON refresh_tokens(token);
+CREATE INDEX idx_refresh_tokens_user_id ON refresh_tokens(user_id);
+```
+
+#### [NEW] `src/main/resources/db/migration/V5__hash_existing_passwords.sql`
+
+> [!NOTE]
+> This uses pgcrypto's `crypt()` / `gen_salt()` to BCrypt-hash existing plaintext passwords directly in PostgreSQL, so the app can authenticate seed data users immediately.
+
+```sql
+UPDATE users SET password = crypt(password, gen_salt('bf', 10));
+```
+
+---
+
+### 10. New File Summary
+
+```
+src/main/java/com/example/springstarter/
+├── controller/
+│   └── AuthController.java                    [NEW]
+├── domain/
+│   ├── dto/
+│   │   ├── AuthResponseDTO.java               [NEW]
+│   │   ├── LoginRequestDTO.java               [NEW]
+│   │   ├── RefreshTokenRequestDTO.java        [NEW]
+│   │   └── RegisterRequestDTO.java            [NEW]
+│   └── entity/
+│       └── RefreshToken.java                  [NEW]
+├── repository/
+│   └── RefreshTokenRepository.java            [NEW]
+├── security/
+│   ├── CustomAccessDeniedHandler.java         [NEW]
+│   ├── JwtAuthenticationEntryPoint.java       [NEW]
+│   ├── JwtAuthenticationFilter.java           [NEW]
+│   ├── JwtService.java                        [NEW]
+│   ├── SecurityConfig.java                    [NEW]
+│   ├── UserDetailsImpl.java                   [NEW]
+│   └── UserDetailsServiceImpl.java            [NEW]
+└── service/
+    └── AuthService.java                       [NEW]
+
+src/main/resources/db/migration/
+├── V4__create_refresh_tokens_table.sql        [NEW]
+└── V5__hash_existing_passwords.sql            [NEW]
+```
+
+---
+
+## Open Questions
+
+> [!IMPORTANT]
+> 1. **Role Enum Fix**: Should I add a Flyway migration to add `'CUSTOMER'` to the existing `user_role` PostgreSQL enum (since it currently only has `'ADMIN'` and `'USER'`)? Or would you prefer to change the Java enum to use `USER` instead of `CUSTOMER`?
+
+> [!IMPORTANT]
+> 2. **Password Hashing in DB**: The `V5` migration uses `pgcrypto` to hash existing plaintext passwords directly. This BCrypt implementation is compatible with Spring Security's `BCryptPasswordEncoder`. Are you okay with this approach, or do you want to handle seed data differently?
+
+> [!IMPORTANT]
+> 3. **`@PreAuthorize` on Controllers**: Should I add method-level security annotations (`@PreAuthorize`) to controllers for fine-grained access (e.g., only ADMIN can create products, customers can only see their own orders), or do you prefer to handle authorization purely at the URL-pattern level in `SecurityConfig`?
+
+---
+
+## Verification Plan
+
+### Automated Tests
+1. `mvn compile` — ensure the project compiles cleanly with all new code
+2. `mvn test` — run existing tests (they should pass after adding `@WithMockUser` or security test config)
+
+### Manual Verification (via Bruno / cURL)
+1. **Register**: `POST /api/auth/register` → expect 200 with access + refresh tokens
+2. **Login**: `POST /api/auth/login` → expect 200 with tokens
+3. **Access protected endpoint without token**: `GET /api/products` → expect 401
+4. **Access with valid token**: `GET /api/products` with `Authorization: Bearer <token>` → expect 200
+5. **Access admin endpoint as CUSTOMER**: `POST /api/products` → expect 403
+6. **Refresh token**: `POST /api/auth/refresh` → expect new access token
+7. **Logout**: `POST /api/auth/logout` → old refresh token should be invalidated

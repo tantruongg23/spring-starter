@@ -11,21 +11,24 @@ import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.stereotype.Service;
 
 import javax.crypto.SecretKey;
+import java.time.Duration;
 import java.util.Date;
 import java.util.Map;
 import java.util.function.Function;
+
+import static com.example.springstarter.domain.enumerate.Role.*;
 
 @Service
 public class JwtService {
 
     private final SecretKey signingKey;
-    private final long accessTokenExpiration;
-    private final long refreshTokenExpiration;
+    private final Duration accessTokenExpiration;
+    private final Duration refreshTokenExpiration;
 
     public JwtService(
             @Value("${security.jwt.secret-key}") String secretKey,
-            @Value("${security.jwt.access-token-expiration}") long accessTokenExpiration,
-            @Value("${security.jwt.refresh-token-expiration}") long refreshTokenExpiration) {
+            @Value("${security.jwt.access-token-expiration}") Duration accessTokenExpiration,
+            @Value("${security.jwt.refresh-token-expiration}") Duration refreshTokenExpiration) {
         this.signingKey = Keys.hmacShaKeyFor(Decoders.BASE64.decode(secretKey));
         this.accessTokenExpiration = accessTokenExpiration;
         this.refreshTokenExpiration = refreshTokenExpiration;
@@ -38,16 +41,16 @@ public class JwtService {
         String role = userDetails.getAuthorities().stream()
                 .findFirst()
                 .map(GrantedAuthority::getAuthority)
-                .orElse("ROLE_CUSTOMER");
+                .orElse(CUSTOMER.getAuthority());
 
-        return buildToken(userDetails.getUsername(), Map.of("role", role), accessTokenExpiration);
+        return buildToken(userDetails.getUsername(), Map.of("role", role), getAccessTokenExpiration());
     }
 
     /**
      * Generate a refresh token (minimal claims — only subject and expiry).
      */
     public String generateRefreshToken(UserDetails userDetails) {
-        return buildToken(userDetails.getUsername(), Map.of(), refreshTokenExpiration);
+        return buildToken(userDetails.getUsername(), Map.of(), getRefreshTokenExpiration());
     }
 
     /**
@@ -78,11 +81,11 @@ public class JwtService {
     }
 
     public long getAccessTokenExpiration() {
-        return accessTokenExpiration;
+        return accessTokenExpiration.toMillis();
     }
 
     public long getRefreshTokenExpiration() {
-        return refreshTokenExpiration;
+        return refreshTokenExpiration.toMillis();
     }
 
     // ---- Private helpers ----

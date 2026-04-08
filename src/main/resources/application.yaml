@@ -24,5 +24,12 @@ server:
 security:
   jwt:
     secret-key: ${JWT_SECRET:dGhpcy1pcy1hLXZlcnktbG9uZy0yNTYtYml0LXNlY3JldC1rZXktZm9yLWRldi1vbmx5LWNoYW5nZS1pbi1wcm9kdWN0aW9u}
-    access-token-expiration: 900000
-    refresh-token-expiration: 604800000
+    access-token-expiration: 2m
+    refresh-token-expiration: 7d
+
+springdoc:
+  api-docs:
+    path: /v3/api-docs
+  swagger-ui:
+    path: /swagger-ui.html
+
