@@ -27,4 +27,5 @@ public class User extends BaseEntity {
 
     @Column(nullable = false, columnDefinition = "user_role")
     private Role role;
+
 }

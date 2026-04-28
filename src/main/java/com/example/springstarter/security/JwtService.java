@@ -23,7 +23,8 @@ import static com.example.springstarter.domain.enumerate.Role.CUSTOMER;
  * <p>
  * Token <em>validation</em> and claim extraction are delegated entirely to
  * Spring Security's {@code NimbusJwtDecoder}, which is configured as a bean
- * in {@link SecurityConfig} and wired into the OAuth2 Resource Server filter chain.
+ * in {@link SecurityConfig} and wired into the OAuth2 Resource Server filter
+ * chain.
  * </p>
  */
 @Service
